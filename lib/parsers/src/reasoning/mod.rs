@@ -8,6 +8,7 @@ mod gemma4_parser;
 mod gpt_oss_parser;
 mod granite_parser;
 mod minimax_append_think_parser;
+mod minimax_m2_parser;
 
 // Re-export main types and functions for convenience
 pub use base_parser::BasicReasoningParser;
@@ -15,6 +16,7 @@ pub use gemma4_parser::Gemma4ReasoningParser;
 pub use gpt_oss_parser::GptOssReasoningParser;
 pub use granite_parser::GraniteReasoningParser;
 pub use minimax_append_think_parser::MiniMaxAppendThinkParser;
+pub use minimax_m2_parser::MiniMaxM2ReasoningParser;
 
 /// Kimi-K2/K2.5 tool-call section marker. Shared between the `kimi_k25` reasoning-parser
 /// registration and its test fixtures so both stay in sync. Mirrors
@@ -61,6 +63,8 @@ fn get_reasoning_parser_map() -> &'static HashMap<&'static str, ReasoningParserT
             "minimax_append_think",
             ReasoningParserType::MiniMaxAppendThink,
         );
+        map.insert("minimax_m2", ReasoningParserType::MiniMaxM2);
+        map.insert("minimax-m2", ReasoningParserType::MiniMaxM2);
         // Gemma 4 thinking models: reasoning is wrapped in `<|channel>...<channel|>`
         // with a `thought\n` role label that this parser strips. Pair with
         // `--dyn-tool-call-parser gemma4` for end-to-end Gemma 4 support.
@@ -148,6 +152,9 @@ pub enum ReasoningParserType {
     Mistral,
     Granite,
     MiniMaxAppendThink,
+    /// MiniMax M2 split-thinking mode. Output begins as reasoning without a
+    /// `<think>` opener and switches to normal content at the first `</think>`.
+    MiniMaxM2,
     /// Google Gemma 4 thinking models. Custom `<|channel>...<channel|>`
     /// delimiters with a `thought\n` role-label prefix stripped by the parser.
     Gemma4,
@@ -251,6 +258,9 @@ impl ReasoningParserType {
             ReasoningParserType::MiniMaxAppendThink => ReasoningParserWrapper {
                 parser: Box::new(MiniMaxAppendThinkParser::new()),
             },
+            ReasoningParserType::MiniMaxM2 => ReasoningParserWrapper {
+                parser: Box::new(MiniMaxM2ReasoningParser::new()),
+            },
             ReasoningParserType::Gemma4 => ReasoningParserWrapper {
                 parser: Box::new(Gemma4ReasoningParser::new()),
             },
@@ -304,6 +314,8 @@ mod tests {
             "nemotron_v3",
             "glm45",
             "minimax_append_think",
+            "minimax_m2",
+            "minimax-m2",
             "gemma4",
             "gemma-4",
         ];

@@ -25,13 +25,14 @@ lib/parsers/
 │   │   ├── json/              — deepseek_v3, deepseek_v3_1, nemotron_deci/nano, jamba, mistral, phi4, llama3_json
 │   │   ├── harmony/           — OpenAI gpt-oss (Harmony token stream, uses openai_harmony crate)
 │   │   └── pythonic/          — Python function-call syntax (some Llama variants)
-│   └── reasoning/           ← reasoning-content extraction (15 registered parsers)
+│   └── reasoning/           ← reasoning-content extraction
 │       ├── mod.rs             — registry + dispatch
 │       ├── base_parser.rs     — BasicReasoningParser (<think> ... </think>)
 │       ├── gemma4_parser.rs   — Gemma 4 (`<|channel>thought\n...<channel|>`)
 │       ├── gpt_oss_parser.rs  — Harmony channel parsing
 │       ├── granite_parser.rs  — Granite-style
-│       └── minimax_append_think_parser.rs  — MiniMax inline-reasoning
+│       ├── minimax_append_think_parser.rs  — MiniMax inline-reasoning
+│       └── minimax_m2_parser.rs  — MiniMax M2 split-reasoning
 ```
 
 ## How a request flows through the crate
@@ -88,6 +89,7 @@ Reasoning parsers:
 | -- | -- | -- | -- |
 | **Basic (think-tag)** | `<think>...</think>` | `reasoning/base_parser.rs` (BasicReasoningParser) | Qwen3, Nemotron, Kimi K2.5, DeepSeek R1 / V4, GLM-4.5+ |
 | **Append-think** | `<think>...</think>` left inline as text, with `<think>` prefix on first chunk | `reasoning/minimax_append_think_parser.rs` | MiniMax M2 |
+| **MiniMax M2 split** | Starts in reasoning, switches to content at first `</think>` | `reasoning/minimax_m2_parser.rs` | MiniMax M2 |
 | **Harmony channel** | Hidden `analysis` channel | `reasoning/gpt_oss_parser.rs` (wraps external `openai_harmony`) | gpt-oss-20B / 120B |
 | **Granite** | Custom start/end tokens | `reasoning/granite_parser.rs` | IBM Granite |
 | **Gemma 4 channel** | `<\|channel>thought\n...<channel\|>` with role-label prefix stripped | `reasoning/gemma4_parser.rs` | Google Gemma 4 thinking models |

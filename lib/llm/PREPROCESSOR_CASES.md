@@ -152,7 +152,7 @@ if you know the answer, fill it in.
 | `pythonic` (tool) | NO | — | — | — | Python list literal. |
 | `mistral` (tool) | NO | — | — | — | `[TOOL_CALLS]` plain text. |
 | `phi4` (tool) | NO | — | — | — | `functools[...]` plain text. |
-| `minimax_m2` (tool) / `minimax_append_think` (reasoning) | NO | — | — | OFF on `tool_choice=required/named` (universal, PRE.4) | XML markers, plain text. |
+| `minimax_m2` (tool) / `minimax_m2` or `minimax_append_think` (reasoning) | NO | — | — | OFF on `tool_choice=required/named` (universal, PRE.4) | XML markers, plain text. |
 | `glm47` (tool) | NO | — | — | — | Plain XML. |
 | `jamba` (tool) | NO | — | — | — | `<tool_calls>` plain text wrapper. |
 | `qwen` (reasoning, basic `<think>`) | NO | — | — | — | Plain `<think>...</think>`. |
