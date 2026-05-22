@@ -26,6 +26,9 @@ pub mod tools;
 pub mod validate;
 pub mod videos;
 
+pub const OPENAI_REASONING_FORMAT_RUNTIME_KEY: &str = "openai_reasoning_format";
+pub const OPENAI_REASONING_FORMAT_MINIMAX: &str = "minimax";
+
 use validate::{
     BEST_OF_RANGE, FREQUENCY_PENALTY_RANGE, MIN_P_RANGE, N_RANGE, PRESENCE_PENALTY_RANGE,
     TEMPERATURE_RANGE, TOP_P_RANGE, validate_range,
@@ -324,6 +327,8 @@ pub struct ParsingOptions {
     pub tool_call_parser: Option<String>,
 
     pub reasoning_parser: Option<String>,
+
+    pub openai_reasoning_format: Option<String>,
 }
 
 impl ParsingOptions {
@@ -331,6 +336,12 @@ impl ParsingOptions {
         Self {
             tool_call_parser,
             reasoning_parser,
+            openai_reasoning_format: None,
         }
+    }
+
+    pub fn with_openai_reasoning_format(mut self, openai_reasoning_format: Option<String>) -> Self {
+        self.openai_reasoning_format = openai_reasoning_format;
+        self
     }
 }

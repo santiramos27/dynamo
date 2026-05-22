@@ -54,6 +54,7 @@ def _make_omni_config(**overrides) -> OmniConfig:
         "durable_kv_events": False,
         "dyn_tool_call_parser": None,
         "dyn_reasoning_parser": None,
+        "dyn_openai_reasoning_format": None,
         "custom_jinja_template": None,
         "endpoint_types": "chat,completions",
         "dump_config_to": None,

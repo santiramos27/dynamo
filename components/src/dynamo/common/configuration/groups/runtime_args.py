@@ -28,6 +28,7 @@ class DynamoRuntimeConfig(ConfigBase):
 
     dyn_tool_call_parser: Optional[str] = None
     dyn_reasoning_parser: Optional[str] = None
+    dyn_openai_reasoning_format: Optional[str] = None
     exclude_tools_when_tool_choice_none: bool = True
     custom_jinja_template: Optional[str] = None
     endpoint_types: str
@@ -143,6 +144,18 @@ class DynamoRuntimeArgGroup(ArgGroup):
             default=None,
             help="Reasoning parser name for the model. If not specified, no reasoning parsing is performed.",
             choices=get_reasoning_parser_names(),
+        )
+        add_argument(
+            g,
+            flag_name="--dyn-openai-reasoning-format",
+            env_var="DYN_OPENAI_REASONING_FORMAT",
+            default=None,
+            help=(
+                "OpenAI-compatible reasoning wire format for the model. "
+                "Use 'minimax' to make omitted reasoning_split merge "
+                "reasoning_content back into <think>...</think> content."
+            ),
+            choices=["minimax"],
         )
         # NOTE: This flag also exists in FrontendArgGroup (frontend_args.py).
         # Both definitions are needed: this one controls the Rust-native chat

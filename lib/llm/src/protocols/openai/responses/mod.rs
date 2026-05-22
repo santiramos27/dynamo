@@ -412,6 +412,7 @@ impl PendingAssistant {
             ChatCompletionRequestAssistantMessage {
                 content,
                 reasoning_content: self.reasoning_content.map(ReasoningContent::Text),
+                reasoning_details: None,
                 refusal: None,
                 name: None,
                 audio: None,

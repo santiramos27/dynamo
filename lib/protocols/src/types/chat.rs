@@ -396,6 +396,24 @@ impl ReasoningContent {
     }
 }
 
+#[derive(Clone, Serialize, Debug, Deserialize, PartialEq)]
+pub struct MiniMaxReasoningDetail {
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index: Option<u32>,
+
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub text: String,
+}
+
 // -- Multimodal content types for responses (not in upstream) --
 
 /// Response content part for text in assistant messages
@@ -579,6 +597,8 @@ pub enum ChatCompletionRequestUserMessageContentPart {
 /// Extends upstream `ChatCompletionRequestAssistantMessage` with:
 /// - `reasoning_content`: interleaved reasoning segments for KV cache correctness
 ///   (DeepSeek-R1, QwQ models)
+/// - `reasoning_details`: MiniMax-compatible reasoning details, normalized by
+///   the OpenAI service layer
 #[derive(Debug, Serialize, Deserialize, Default, Clone, Builder, PartialEq)]
 #[builder(name = "ChatCompletionRequestAssistantMessageArgs")]
 #[builder(pattern = "mutable")]
@@ -591,6 +611,9 @@ pub struct ChatCompletionRequestAssistantMessage {
     /// Reasoning content from a previous assistant turn.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<ReasoningContent>,
+    /// MiniMax-compatible reasoning content from a previous assistant turn.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_details: Option<Vec<MiniMaxReasoningDetail>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refusal: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

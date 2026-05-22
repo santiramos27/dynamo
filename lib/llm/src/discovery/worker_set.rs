@@ -137,10 +137,19 @@ impl WorkerSet {
 
     /// Build ParsingOptions from this WorkerSet's card configuration.
     pub fn parsing_options(&self) -> crate::protocols::openai::ParsingOptions {
+        let openai_reasoning_format = self
+            .card
+            .runtime_config
+            .runtime_data
+            .get(crate::protocols::openai::OPENAI_REASONING_FORMAT_RUNTIME_KEY)
+            .and_then(serde_json::Value::as_str)
+            .map(ToString::to_string);
+
         crate::protocols::openai::ParsingOptions::new(
             self.card.runtime_config.tool_call_parser.clone(),
             self.card.runtime_config.reasoning_parser.clone(),
         )
+        .with_openai_reasoning_format(openai_reasoning_format)
     }
 
     /// Number of active workers in this set, derived from the Client's discovery watcher.
@@ -187,6 +196,20 @@ mod tests {
         let ws = make_worker_set("ns1", "abc123");
         assert_eq!(ws.namespace(), "ns1");
         assert_eq!(ws.mdcsum(), "abc123");
+    }
+
+    #[test]
+    fn test_parsing_options_include_openai_reasoning_format() {
+        let mut card = ModelDeploymentCard::default();
+        card.runtime_config
+            .runtime_data
+            .insert("openai_reasoning_format".to_string(), "minimax".into());
+        let ws = WorkerSet::new("ns1".to_string(), "abc123".to_string(), card);
+
+        assert_eq!(
+            ws.parsing_options().openai_reasoning_format.as_deref(),
+            Some("minimax")
+        );
     }
 
     #[test]

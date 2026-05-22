@@ -3,6 +3,7 @@
 
 import asyncio
 import inspect
+import json
 import logging
 import os
 
@@ -68,6 +69,8 @@ from dynamo.vllm.kv_connector_protocols import (
 )
 
 from .args import Config
+
+OPENAI_REASONING_FORMAT_RUNTIME_KEY = "openai_reasoning_format"
 from .constants import DisaggregationMode, EmbeddingTransferMode
 from .engine_monitor import VllmEngineMonitor
 from .multimodal_utils.hash_utils import compute_mm_uuids_from_images
@@ -1243,6 +1246,13 @@ class BaseWorkerHandler(ABC, Generic[RequestT, ResponseT]):
                             runtime_config.reasoning_parser = (
                                 self.config.dyn_reasoning_parser
                             )
+                            if self.config.dyn_openai_reasoning_format:
+                                runtime_config.set_engine_specific(
+                                    OPENAI_REASONING_FORMAT_RUNTIME_KEY,
+                                    json.dumps(
+                                        self.config.dyn_openai_reasoning_format
+                                    ),
+                                )
 
                             # Publish with format: v1/mdc/dynamo/backend/generate/{instance_id}/{lora_slug}
                             await register_model(

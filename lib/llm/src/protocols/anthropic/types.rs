@@ -75,6 +75,7 @@ impl TryFrom<AnthropicCreateMessageRequest> for NvCreateChatCompletionRequest {
                                 content.clone(),
                             )),
                             reasoning_content: None,
+                            reasoning_details: None,
                             refusal: None,
                             name: None,
                             audio: None,
@@ -371,6 +372,7 @@ fn convert_assistant_blocks(
         ChatCompletionRequestAssistantMessage {
             content,
             reasoning_content,
+            reasoning_details: None,
             refusal: None,
             name: None,
             audio: None,

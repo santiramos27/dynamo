@@ -50,6 +50,7 @@ from dynamo.vllm.cache_info import (
 from .handlers import build_sampling_params, get_dp_range_for_worker
 
 logger = logging.getLogger(__name__)
+OPENAI_REASONING_FORMAT_RUNTIME_KEY = "openai_reasoning_format"
 
 
 class _DpRankMetricsCache:
@@ -120,9 +121,15 @@ class _UnifiedStatLoggerFactory:
 
 
 class VllmLLMEngine(LLMEngine):
-    def __init__(self, engine_args, disaggregation_mode: DisaggregationMode):
+    def __init__(
+        self,
+        engine_args,
+        disaggregation_mode: DisaggregationMode,
+        openai_reasoning_format: str | None = None,
+    ):
         self.engine_args = engine_args
         self.disaggregation_mode = disaggregation_mode
+        self.openai_reasoning_format = openai_reasoning_format
         self.engine_client: AsyncLLM | None = None
         self._vllm_config: Any = None
         self._default_sampling_params: Any = None
@@ -155,7 +162,11 @@ class VllmLLMEngine(LLMEngine):
         # is still the input union, so narrow it here for mypy (cast
         # rather than assert so `-O` builds don't drop the narrowing).
         mode = cast(DisaggregationMode, config.disaggregation_mode)
-        engine = cls(config.engine_args, mode)
+        engine = cls(
+            config.engine_args,
+            mode,
+            openai_reasoning_format=config.dyn_openai_reasoning_format,
+        )
         worker_config = WorkerConfig.from_runtime_config(
             config,
             model_name=config.model,
@@ -208,6 +219,12 @@ class VllmLLMEngine(LLMEngine):
         await configure_kv_event_block_size(self.engine_client, vllm_config)
         block_size = get_configured_kv_event_block_size(vllm_config)
 
+        runtime_data = (
+            {OPENAI_REASONING_FORMAT_RUNTIME_KEY: self.openai_reasoning_format}
+            if self.openai_reasoning_format
+            else None
+        )
+
         return EngineConfig(
             model=self.engine_args.model,
             served_model_name=self.engine_args.served_model_name,
@@ -219,6 +236,7 @@ class VllmLLMEngine(LLMEngine):
             # Router needs the rank range to enumerate per-rank load.
             data_parallel_start_rank=self._dp_range[0],
             data_parallel_size=self._dp_range[1],
+            runtime_data=runtime_data,
         )
 
     async def generate(

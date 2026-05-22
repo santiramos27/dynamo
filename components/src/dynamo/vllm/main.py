@@ -3,6 +3,7 @@
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 import tempfile
@@ -45,6 +46,8 @@ from . import envs
 from .args import Config, _uses_dynamo_connector, parse_args
 from .cache_info import get_configured_kv_event_block_size
 from .constants import DisaggregationMode
+
+OPENAI_REASONING_FORMAT_RUNTIME_KEY = "openai_reasoning_format"
 from .handlers import get_dp_range_for_worker
 from .publisher import DYNAMO_COMPONENT_REGISTRY, StatLoggerFactory
 from .snapshot import prepare_snapshot_engine
@@ -643,6 +646,11 @@ async def register_vllm_model(
     runtime_config.exclude_tools_when_tool_choice_none = (
         config.exclude_tools_when_tool_choice_none
     )
+    if config.dyn_openai_reasoning_format:
+        runtime_config.set_engine_specific(
+            OPENAI_REASONING_FORMAT_RUNTIME_KEY,
+            json.dumps(config.dyn_openai_reasoning_format),
+        )
 
     # Propagate stream_interval so the frontend can respect --stream-interval.
     # set_engine_specific requires a JSON-encoded string (the Rust binding

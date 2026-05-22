@@ -36,8 +36,8 @@ use super::{
     disconnect::{ConnectionHandle, create_connection_monitor, monitor_for_disconnects},
     error::HttpError,
     metrics::{
-        CancellationLabels, Endpoint, ErrorType, EventConverter,
-        process_response_and_observe_metrics,
+        CancellationLabels, Endpoint, ErrorType, EventConverter, HttpQueueGuard,
+        ResponseMetricCollector, process_response_and_observe_metrics,
         process_response_using_event_converter_and_observe_metrics,
     },
     service_v2,
@@ -46,6 +46,7 @@ use crate::engines::ValidateRequest;
 use crate::protocols::openai::chat_completions::aggregator::ChatCompletionAggregator;
 use crate::protocols::openai::nvext::apply_header_routing_overrides;
 use crate::protocols::openai::{
+    OPENAI_REASONING_FORMAT_MINIMAX,
     audios::{NvAudioSpeechResponse, NvCreateAudioSpeechRequest},
     chat_completions::{
         NvCreateChatCompletionRequest, NvCreateChatCompletionResponse,
@@ -61,6 +62,7 @@ use crate::protocols::unified::UnifiedRequest;
 use crate::request_template::RequestTemplate;
 use crate::types::Annotated;
 use dynamo_runtime::logging::get_distributed_tracing_context;
+use serde_json::Value;
 use tracing::Instrument;
 
 pub const DYNAMO_REQUEST_ID_HEADER: &str = "x-dynamo-request-id";
@@ -72,6 +74,8 @@ pub const ANNOTATION_REQUEST_ID: &str = "request_id";
 const VALIDATION_PREFIX: &str = "Validation: ";
 const ADMISSION_CONTROL_REJECTION_HINT: &str =
     "If this rejection is not intended, consider passing --no-admission-control to the frontend.";
+const MINIMAX_REASONING_DETAIL_TYPE: &str = "reasoning.text";
+const MINIMAX_REASONING_DETAIL_FORMAT: &str = "MiniMax-response-v1";
 
 // Default axum max body limit without configuring is 2MB: https://docs.rs/axum/latest/axum/extract/struct.DefaultBodyLimit.html
 /// Default body limit in bytes (45MB) to support 500k+ token payloads.
@@ -910,6 +914,7 @@ async fn handler_chat_completions(
     // return a 503 if the service is not ready
     check_ready(&state)?;
 
+    request.normalize_minimax_reasoning_details();
     request.nvext = apply_header_routing_overrides(request.nvext.take(), &headers);
 
     // create the context for the request
@@ -1196,6 +1201,7 @@ async fn chat_completions(
     // Determine streaming mode early
     // todo - decide on default
     let streaming = request.inner.stream.unwrap_or(false);
+    let minimax_reasoning_split = request.minimax_reasoning_split();
 
     // Apply template values first to resolve the model before creating metrics guards
     if let Some(template) = template {
@@ -1266,6 +1272,10 @@ async fn chat_completions(
             inflight_guard.mark_error(extract_error_type_from_response(&err_response));
             err_response
         })?;
+    let minimax_reasoning_split = minimax_reasoning_split_or_default(
+        minimax_reasoning_split,
+        parsing_options.openai_reasoning_format.as_deref(),
+    );
 
     let mut response_collector = state.metrics_clone().create_response_collector(&model);
 
@@ -1318,6 +1328,7 @@ async fn chat_completions(
         let reasoning_dispatch_enabled = state.streaming_reasoning_dispatch_enabled();
         let mut reasoning_buffer: HashMap<u32, String> = HashMap::new();
         let mut dispatched_tool_ids: HashSet<String> = HashSet::new();
+        let mut minimax_stream_state = MinimaxReasoningStreamState::default();
 
         // flat_map lets us optionally prepend extra SSE events before each regular chunk:
         //   - `event: tool_call_dispatch`  — complete tool call detected early (tool dispatch)
@@ -1341,11 +1352,21 @@ async fn chat_completions(
 
             // Convert to SSE event (this consumes the response).
             // EventConverter will detect `event: "error"` and convert to SSE error events.
-            let sse_result = process_response_using_event_converter_and_observe_metrics(
-                EventConverter::from(response),
-                &mut response_collector,
-                &mut http_queue_guard,
-            );
+            let sse_result = if let Some(reasoning_split) = minimax_reasoning_split {
+                process_minimax_chat_stream_response(
+                    response,
+                    reasoning_split,
+                    &mut minimax_stream_state,
+                    &mut response_collector,
+                    &mut http_queue_guard,
+                )
+            } else {
+                process_response_using_event_converter_and_observe_metrics(
+                    EventConverter::from(response),
+                    &mut response_collector,
+                    &mut http_queue_guard,
+                )
+            };
 
             // Side-channel events come first, then the regular data event.
             match sse_result {
@@ -1402,14 +1423,279 @@ async fn chat_completions(
                     err_response
                 })?;
 
+        let response = if let Some(reasoning_split) = minimax_reasoning_split {
+            let mut response = serde_json::to_value(&response).map_err(|e| {
+                let err_response = ErrorMessage::internal_server_error(&format!(
+                    "Failed to serialize chat completion response: {}",
+                    e
+                ));
+                inflight_guard.mark_error(extract_error_type_from_response(&err_response));
+                err_response
+            })?;
+            apply_minimax_reasoning_split_to_response(&mut response, reasoning_split);
+            Json(response).into_response()
+        } else {
+            Json(response).into_response()
+        };
+
         inflight_guard.mark_ok();
         // If the engine context was killed (client disconnect), the response was
         // assembled but never delivered. Override to cancelled.
         if ctx.is_killed() {
             inflight_guard.mark_error(ErrorType::Cancelled);
         }
-        Ok(Json(response).into_response())
+        Ok(response)
     }
+}
+
+#[derive(Default)]
+struct MinimaxReasoningStreamState {
+    open_reasoning_choices: HashSet<u32>,
+}
+
+fn process_minimax_chat_stream_response(
+    mut response: Annotated<NvCreateChatCompletionStreamResponse>,
+    reasoning_split: bool,
+    stream_state: &mut MinimaxReasoningStreamState,
+    response_collector: &mut ResponseMetricCollector,
+    http_queue_guard: &mut Option<HttpQueueGuard>,
+) -> Result<Option<Event>, axum::Error> {
+    process_response_and_observe_metrics(&response, response_collector, http_queue_guard);
+
+    if response.event.as_deref() == Some(crate::preprocessor::ANNOTATION_LLM_METRICS) {
+        response.event = None;
+        response.comment = None;
+    }
+
+    let mut event = Event::default();
+    let has_data = response.data.is_some();
+
+    if let Some(ref data) = response.data {
+        let mut data = serde_json::to_value(data).map_err(axum::Error::new)?;
+        apply_minimax_reasoning_split_to_stream_response(&mut data, reasoning_split, stream_state);
+        event = event.json_data(&data)?;
+    }
+
+    if let Some(ref msg) = response.event {
+        if msg == "error" {
+            let error_message = if let Some(ref dynamo_err) = response.error {
+                if dynamo_err.message().is_empty() {
+                    None
+                } else {
+                    Some(dynamo_err.message().to_string())
+                }
+            } else {
+                None
+            }
+            .or_else(|| {
+                response.comment.as_ref().and_then(|comments| {
+                    let joined = comments.join(" -- ");
+                    if joined.trim().is_empty() {
+                        None
+                    } else {
+                        Some(joined)
+                    }
+                })
+            })
+            .unwrap_or_else(|| "unspecified error".to_string());
+            return Err(axum::Error::new(error_message));
+        }
+        event = event.event(msg);
+    }
+
+    if let Some(comments) = response.comment {
+        for comment in comments {
+            event = event.comment(comment.replace(['\n', '\r'], " "));
+        }
+    }
+
+    if !has_data && response.event.is_none() {
+        Ok(None)
+    } else {
+        Ok(Some(event))
+    }
+}
+
+fn apply_minimax_reasoning_split_to_response(response: &mut Value, reasoning_split: bool) {
+    let Some(choices) = response.get_mut("choices").and_then(Value::as_array_mut) else {
+        return;
+    };
+
+    for choice in choices {
+        let choice_index = json_u32(choice.get("index")).unwrap_or(0);
+        let Some(message) = choice.get_mut("message") else {
+            continue;
+        };
+        apply_minimax_reasoning_split_to_message(message, choice_index, reasoning_split);
+    }
+}
+
+fn minimax_reasoning_split_or_default(
+    request_value: Option<bool>,
+    openai_reasoning_format: Option<&str>,
+) -> Option<bool> {
+    request_value
+        .or_else(|| is_minimax_openai_reasoning_format(openai_reasoning_format).then_some(false))
+}
+
+fn is_minimax_openai_reasoning_format(openai_reasoning_format: Option<&str>) -> bool {
+    openai_reasoning_format
+        .map(|format| format.eq_ignore_ascii_case(OPENAI_REASONING_FORMAT_MINIMAX))
+        .unwrap_or(false)
+}
+
+fn apply_minimax_reasoning_split_to_stream_response(
+    response: &mut Value,
+    reasoning_split: bool,
+    stream_state: &mut MinimaxReasoningStreamState,
+) {
+    let Some(choices) = response.get_mut("choices").and_then(Value::as_array_mut) else {
+        return;
+    };
+
+    for choice in choices {
+        let choice_index = json_u32(choice.get("index")).unwrap_or(0);
+        let finished = choice
+            .get("finish_reason")
+            .map(|value| !value.is_null())
+            .unwrap_or(false);
+        let Some(delta) = choice.get_mut("delta") else {
+            continue;
+        };
+        apply_minimax_reasoning_split_to_delta(
+            delta,
+            choice_index,
+            finished,
+            reasoning_split,
+            stream_state,
+        );
+    }
+}
+
+fn apply_minimax_reasoning_split_to_message(
+    message: &mut Value,
+    choice_index: u32,
+    reasoning_split: bool,
+) {
+    let Some(reasoning) = take_string_field(message, "reasoning_content") else {
+        return;
+    };
+
+    if reasoning.is_empty() {
+        return;
+    }
+
+    if reasoning_split {
+        insert_reasoning_details(message, choice_index, 0, reasoning);
+    } else {
+        prepend_text_to_content(message, format!("<think>{}</think>", reasoning));
+    }
+}
+
+fn apply_minimax_reasoning_split_to_delta(
+    delta: &mut Value,
+    choice_index: u32,
+    finished: bool,
+    reasoning_split: bool,
+    stream_state: &mut MinimaxReasoningStreamState,
+) {
+    let reasoning = take_string_field(delta, "reasoning_content");
+
+    if reasoning_split {
+        if let Some(reasoning) = reasoning
+            && !reasoning.is_empty()
+        {
+            insert_reasoning_details(delta, choice_index, 0, reasoning);
+        }
+        return;
+    }
+
+    let mut prefix = String::new();
+    if let Some(reasoning) = reasoning
+        && !reasoning.is_empty()
+    {
+        if stream_state.open_reasoning_choices.insert(choice_index) {
+            prefix.push_str("<think>");
+        }
+        prefix.push_str(&reasoning);
+    }
+
+    let has_content = delta
+        .get("content")
+        .and_then(Value::as_str)
+        .map(|content| !content.is_empty())
+        .unwrap_or(false);
+
+    if stream_state.open_reasoning_choices.contains(&choice_index) && (has_content || finished) {
+        stream_state.open_reasoning_choices.remove(&choice_index);
+        prefix.push_str("</think>");
+    }
+
+    if !prefix.is_empty() {
+        prepend_text_to_content(delta, prefix);
+    }
+}
+
+fn insert_reasoning_details(
+    value: &mut Value,
+    choice_index: u32,
+    detail_index: u32,
+    reasoning: String,
+) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+
+    let detail = serde_json::json!({
+        "type": MINIMAX_REASONING_DETAIL_TYPE,
+        "id": format!("reasoning-text-{}", choice_index.saturating_add(1)),
+        "format": MINIMAX_REASONING_DETAIL_FORMAT,
+        "index": detail_index,
+        "text": reasoning,
+    });
+    object.insert("reasoning_details".to_string(), Value::Array(vec![detail]));
+}
+
+fn prepend_text_to_content(value: &mut Value, text: String) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+
+    let content = match object.remove("content") {
+        Some(Value::String(existing)) if !existing.is_empty() => {
+            Value::String(format!("{}{}", text, existing))
+        }
+        Some(Value::String(_)) | Some(Value::Null) | None => Value::String(text),
+        Some(Value::Array(mut parts)) => {
+            parts.insert(
+                0,
+                serde_json::json!({
+                    "type": "text",
+                    "text": text,
+                }),
+            );
+            Value::Array(parts)
+        }
+        Some(other) => other,
+    };
+
+    object.insert("content".to_string(), content);
+}
+
+fn take_string_field(value: &mut Value, field: &str) -> Option<String> {
+    value
+        .as_object_mut()
+        .and_then(|object| object.remove(field))
+        .and_then(|value| match value {
+            Value::String(text) => Some(text),
+            _ => None,
+        })
+}
+
+fn json_u32(value: Option<&Value>) -> Option<u32> {
+    value
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
 }
 
 /// Checks for unsupported fields in the request.
@@ -2674,6 +2960,110 @@ mod tests {
             },
             nvext: None,
         }
+    }
+
+    #[test]
+    fn test_minimax_reasoning_split_true_rewrites_response_message() {
+        use serde_json::json;
+
+        let mut response = json!({
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "final answer",
+                    "reasoning_content": "reasoning text"
+                }
+            }]
+        });
+
+        apply_minimax_reasoning_split_to_response(&mut response, true);
+
+        let message = &response["choices"][0]["message"];
+        assert!(message.get("reasoning_content").is_none());
+        assert_eq!(message["content"], "final answer");
+        assert_eq!(message["reasoning_details"][0]["type"], "reasoning.text");
+        assert_eq!(
+            message["reasoning_details"][0]["format"],
+            "MiniMax-response-v1"
+        );
+        assert_eq!(message["reasoning_details"][0]["index"], 0);
+        assert_eq!(message["reasoning_details"][0]["text"], "reasoning text");
+    }
+
+    #[test]
+    fn test_minimax_reasoning_split_false_merges_response_message() {
+        use serde_json::json;
+
+        let mut response = json!({
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "final answer",
+                    "reasoning_content": "reasoning text"
+                }
+            }]
+        });
+
+        apply_minimax_reasoning_split_to_response(&mut response, false);
+
+        let message = &response["choices"][0]["message"];
+        assert!(message.get("reasoning_content").is_none());
+        assert_eq!(
+            message["content"],
+            "<think>reasoning text</think>final answer"
+        );
+    }
+
+    #[test]
+    fn test_minimax_reasoning_split_defaults_false_for_minimax_format() {
+        assert_eq!(
+            minimax_reasoning_split_or_default(None, Some("minimax")),
+            Some(false)
+        );
+        assert_eq!(
+            minimax_reasoning_split_or_default(None, Some("MiniMax")),
+            Some(false)
+        );
+        assert_eq!(
+            minimax_reasoning_split_or_default(None, Some("qwen3")),
+            None
+        );
+        assert_eq!(
+            minimax_reasoning_split_or_default(Some(true), Some("minimax")),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_minimax_stream_reasoning_split_false_closes_think_block() {
+        use serde_json::json;
+
+        let mut state = MinimaxReasoningStreamState::default();
+        let mut reasoning_chunk = json!({
+            "choices": [{
+                "index": 0,
+                "delta": {"reasoning_content": "reasoning"},
+                "finish_reason": null
+            }]
+        });
+        let mut content_chunk = json!({
+            "choices": [{
+                "index": 0,
+                "delta": {"content": "final"},
+                "finish_reason": null
+            }]
+        });
+
+        apply_minimax_reasoning_split_to_stream_response(&mut reasoning_chunk, false, &mut state);
+        apply_minimax_reasoning_split_to_stream_response(&mut content_chunk, false, &mut state);
+
+        let reasoning_delta = &reasoning_chunk["choices"][0]["delta"];
+        let content_delta = &content_chunk["choices"][0]["delta"];
+        assert!(reasoning_delta.get("reasoning_content").is_none());
+        assert_eq!(reasoning_delta["content"], "<think>reasoning");
+        assert_eq!(content_delta["content"], "</think>final");
     }
 
     #[test]

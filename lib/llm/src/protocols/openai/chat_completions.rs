@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use dynamo_protocols::types::{ChatCompletionRequestMessage, ReasoningContent};
 use dynamo_runtime::protocols::annotated::AnnotationsProvider;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -23,6 +24,8 @@ pub mod jail;
 
 pub use aggregator::DeltaAggregator;
 pub use delta::DeltaGenerator;
+
+const MINIMAX_REASONING_SPLIT_FIELD: &str = "reasoning_split";
 
 /// A request structure for creating a chat completion, extending OpenAI's
 /// `CreateChatCompletionRequest` with [`NvExt`] extensions and common fields.
@@ -67,6 +70,53 @@ pub struct NvCreateChatCompletionRequest {
     /// Catch-all for unsupported fields - checked during validation
     #[serde(flatten, default, skip_serializing)]
     pub unsupported_fields: std::collections::HashMap<String, serde_json::Value>,
+}
+
+impl NvCreateChatCompletionRequest {
+    /// MiniMax's OpenAI-compatible API accepts a non-standard `reasoning_split`
+    /// boolean. Keep it in the flattened extension map so normal OpenAI clients
+    /// are unchanged while the HTTP layer can opt into MiniMax response shaping.
+    pub fn minimax_reasoning_split(&self) -> Option<bool> {
+        self.unsupported_fields
+            .get(MINIMAX_REASONING_SPLIT_FIELD)
+            .and_then(|value| value.as_bool())
+    }
+
+    /// MiniMax sends prior assistant reasoning as `reasoning_details`. Dynamo's
+    /// formatter and reasoning parsers already understand `reasoning_content`,
+    /// so normalize the MiniMax shape at the protocol boundary.
+    pub fn normalize_minimax_reasoning_details(&mut self) {
+        for message in &mut self.inner.messages {
+            let ChatCompletionRequestMessage::Assistant(assistant) = message else {
+                continue;
+            };
+
+            let Some(details) = assistant.reasoning_details.take() else {
+                continue;
+            };
+
+            if assistant.reasoning_content.is_some() {
+                continue;
+            }
+
+            let mut indexed_details = details.into_iter().enumerate().collect::<Vec<_>>();
+            indexed_details.sort_by_key(|(position, detail)| {
+                (detail.index.unwrap_or(*position as u32), *position)
+            });
+
+            let mut segments = indexed_details
+                .into_iter()
+                .map(|(_, detail)| detail.text)
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>();
+
+            assistant.reasoning_content = match segments.len() {
+                0 => None,
+                1 => Some(ReasoningContent::Text(segments.remove(0))),
+                _ => Some(ReasoningContent::Segments(segments)),
+            };
+        }
+    }
 }
 
 /// A response structure for unary chat completion responses, embedding OpenAI's
@@ -340,7 +390,13 @@ impl OpenAIOutputOptionsProvider for NvCreateChatCompletionRequest {
 /// allowing us to validate the data.
 impl ValidateRequest for NvCreateChatCompletionRequest {
     fn validate(&self) -> Result<(), anyhow::Error> {
-        validate::validate_no_unsupported_fields(&self.unsupported_fields)?;
+        let mut unsupported_fields = self.unsupported_fields.clone();
+        if let Some(value) = unsupported_fields.remove(MINIMAX_REASONING_SPLIT_FIELD)
+            && !value.is_boolean()
+        {
+            anyhow::bail!("`reasoning_split` must be a boolean");
+        }
+        validate::validate_no_unsupported_fields(&unsupported_fields)?;
         validate::validate_messages(&self.inner.messages)?;
         validate::validate_model(&self.inner.model)?;
         // none for store
@@ -388,6 +444,74 @@ mod tests {
     use crate::engines::ValidateRequest;
     use crate::protocols::common::{OutputOptionsProvider, StopConditionsProvider};
     use serde_json::json;
+
+    #[test]
+    fn test_minimax_reasoning_split_bool_is_accepted() {
+        let json_str = json!({
+            "model": "test-model",
+            "messages": [
+                {"role": "user", "content": "Hello"}
+            ],
+            "reasoning_split": true
+        });
+
+        let request: NvCreateChatCompletionRequest =
+            serde_json::from_value(json_str).expect("Failed to deserialize request");
+
+        assert_eq!(request.minimax_reasoning_split(), Some(true));
+        crate::engines::ValidateRequest::validate(&request)
+            .expect("reasoning_split bool should validate");
+    }
+
+    #[test]
+    fn test_minimax_reasoning_split_non_bool_is_rejected() {
+        let json_str = json!({
+            "model": "test-model",
+            "messages": [
+                {"role": "user", "content": "Hello"}
+            ],
+            "reasoning_split": "true"
+        });
+
+        let request: NvCreateChatCompletionRequest =
+            serde_json::from_value(json_str).expect("Failed to deserialize request");
+
+        let error = crate::engines::ValidateRequest::validate(&request)
+            .expect_err("string value should be rejected");
+        assert!(error.to_string().contains("reasoning_split"));
+    }
+
+    #[test]
+    fn test_normalize_minimax_reasoning_details_to_reasoning_content() {
+        let json_str = json!({
+            "model": "test-model",
+            "messages": [{
+                "role": "assistant",
+                "content": "tool result",
+                "reasoning_details": [
+                    {"type": "reasoning.text", "index": 1, "text": "second"},
+                    {"type": "reasoning.text", "index": 0, "text": "first"}
+                ]
+            }]
+        });
+
+        let mut request: NvCreateChatCompletionRequest =
+            serde_json::from_value(json_str).expect("Failed to deserialize request");
+
+        request.normalize_minimax_reasoning_details();
+
+        let ChatCompletionRequestMessage::Assistant(assistant) = &request.inner.messages[0] else {
+            panic!("expected assistant message");
+        };
+        assert!(assistant.reasoning_details.is_none());
+        assert_eq!(
+            assistant.reasoning_content,
+            Some(ReasoningContent::Segments(vec![
+                "first".to_string(),
+                "second".to_string()
+            ]))
+        );
+    }
 
     #[test]
     fn test_skip_special_tokens_none() {
